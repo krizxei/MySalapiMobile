@@ -21,7 +21,13 @@
     },
     "plugins": [
       "expo-router",
-      "expo-audio"
+      "expo-audio",
+      "expo-asset",
+      "expo-font",
+      "expo-secure-store",
+      "expo-splash-screen",
+      "expo-status-bar",
+      "expo-web-browser"
     ],
     "scheme": "mysalapi",
     "experiments": {
