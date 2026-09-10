@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity,
-  Alert, RefreshControl, Modal, KeyboardAvoidingView, Platform,
+  Alert, RefreshControl, Modal, TextInput, KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -11,7 +11,6 @@ import { useTheme } from '../context/ThemeContext';
 import { format } from 'date-fns';
 import { sendGroupSingil } from '../lib/api';
 import AppModal from '../components/AppModal';
-
 
 const PAYMENT_METHODS = ['GCash', 'Maya', 'BDO', 'BPI', 'Cash', 'Other'];
 
@@ -27,10 +26,14 @@ export default function GroupDetailScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [sendingSingil, setSendingSingil] = React.useState<string | null>(null);
 
-  // Mark Paid confirmation modal
+  // Record Payment modal
   const [showPayModal, setShowPayModal] = useState(false);
   const [payingParticipant, setPayingParticipant] = useState<any>(null);
+  const [payAmount, setPayAmount] = useState('');
   const [selectedPayMethod, setSelectedPayMethod] = useState('GCash');
+
+  const [showErrorModal, setShowErrorModal] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
 
   const [showSingilConfirm, setShowSingilConfirm] = useState(false);
   const [singilTarget, setSingilTarget] = useState<any>(null);
@@ -38,6 +41,11 @@ export default function GroupDetailScreen() {
   const [showSingilResult, setShowSingilResult] = useState(false);
   const [singilResultOk, setSingilResultOk] = useState(true);
   const [singilResultMsg, setSingilResultMsg] = useState('');
+
+  const showError = (msg: string) => {
+    setErrorMsg(msg);
+    setShowErrorModal(true);
+  };
 
   const loadData = async () => {
     const { data: groupData } = await supabase
@@ -59,33 +67,64 @@ export default function GroupDetailScreen() {
   const onRefresh = async () => { setRefreshing(true); await loadData(); setRefreshing(false); };
   const isPayer = group?.payer_id === user?.id;
 
-  // Open the mark paid confirmation
+  const remainingFor = (p: any) => Math.max(Number(p.share_amount) - Number(p.amount_paid || 0), 0);
+  const isFullyPaid = (p: any) => Number(p.amount_paid || 0) >= Number(p.share_amount);
+  const isPartiallyPaid = (p: any) => Number(p.amount_paid || 0) > 0 && !isFullyPaid(p);
+
+  // Open the record payment modal
   const openPayModal = (participant: any) => {
     setPayingParticipant(participant);
-    // Pre-select the group's payment method if set
+    setPayAmount(String(remainingFor(participant)));
     setSelectedPayMethod(group?.payment_method || 'GCash');
     setShowPayModal(true);
   };
 
-  // Confirm mark paid
-  const confirmMarkPaid = async () => {
+  // Confirm and record a (possibly partial) payment
+  const confirmRecordPayment = async () => {
     if (!payingParticipant) return;
+    const amount = parseFloat(payAmount);
+    if (isNaN(amount) || amount <= 0) { showError('Enter a valid amount.'); return; }
+
+    const remaining = remainingFor(payingParticipant);
+    if (amount > remaining) {
+      showError(`Amount exceeds remaining balance of ₱${remaining.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`);
+      return;
+    }
+
+    const newAmountPaid = Number(payingParticipant.amount_paid || 0) + amount;
+    const nowFullyPaid = newAmountPaid >= Number(payingParticipant.share_amount);
+
+    // Log the payment
+    await supabase.from('group_participant_payments').insert({
+      group_participant_id: payingParticipant.id,
+      amount,
+      payment_date: new Date().toISOString().split('T')[0],
+      payment_method: selectedPayMethod,
+      recorded_by: user!.id,
+    });
+
+    // Update the participant's running total
     await supabase
       .from('group_participants')
-      .update({ is_paid: true, paid_at: new Date().toISOString() })
+      .update({
+        amount_paid: newAmountPaid,
+        is_paid: nowFullyPaid,
+        paid_at: nowFullyPaid ? new Date().toISOString() : payingParticipant.paid_at,
+      })
       .eq('id', payingParticipant.id);
 
-    // Check if all paid — auto-settle group
+    // Check if all participants are now fully paid — auto-settle group
     const updated = participants.map((p) =>
-      p.id === payingParticipant.id ? { ...p, is_paid: true } : p
+      p.id === payingParticipant.id ? { ...p, amount_paid: newAmountPaid } : p
     );
-    const allPaid = updated.every((p) => p.is_paid);
+    const allPaid = updated.every((p) => Number(p.amount_paid || 0) >= Number(p.share_amount));
     if (allPaid) {
       await supabase.from('group_expenses').update({ status: 'settled' }).eq('id', id);
     }
 
     setShowPayModal(false);
     setPayingParticipant(null);
+    setPayAmount('');
     loadData();
   };
 
@@ -102,9 +141,10 @@ export default function GroupDetailScreen() {
     setSendingSingil(participant.id);
     const { data: payerProfile } = await supabase
       .from('users').select('full_name, email').eq('id', user!.id).single();
+    const remaining = remainingFor(participant);
     const { data: notif } = await supabase.from('email_notifications').insert({
       recipient_email: participant.participant?.email,
-      subject_email: `Group Expense Reminder: ₱${participant.share_amount} for ${group?.title}`,
+      subject_email: `Group Expense Reminder: ₱${remaining} for ${group?.title}`,
       notification_type: 'group_singil',
       subject_cost_id: group?.id,
       status: 'pending',
@@ -113,7 +153,7 @@ export default function GroupDetailScreen() {
       recipient_email: participant.participant?.email,
       payer_name: payerProfile?.full_name || payerProfile?.email || 'Your friend',
       group_title: group?.title,
-      share_amount: Number(participant.share_amount),
+      share_amount: remaining,
       payment_method: group?.payment_method,
       payment_details: group?.payment_details,
       notification_id: notif?.id,
@@ -127,10 +167,8 @@ export default function GroupDetailScreen() {
   const formatCurrency = (n: number) =>
     `₱${Number(n).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
 
-  const paidCount = participants.filter((p) => p.is_paid).length;
-  const totalCollected = participants
-    .filter((p) => p.is_paid)
-    .reduce((s, p) => s + Number(p.share_amount), 0);
+  const fullyPaidCount = participants.filter((p) => isFullyPaid(p)).length;
+  const totalCollected = participants.reduce((s, p) => s + Number(p.amount_paid || 0), 0);
 
   const styles = makeStyles(colors);
 
@@ -196,13 +234,13 @@ export default function GroupDetailScreen() {
           {/* Progress */}
           <View style={styles.progressSection}>
             <View style={styles.progressHeader}>
-              <Text style={styles.progressLabel}>{paidCount}/{participants.length} paid</Text>
+              <Text style={styles.progressLabel}>{fullyPaidCount}/{participants.length} fully paid</Text>
               <Text style={styles.progressAmount}>{formatCurrency(totalCollected)} collected</Text>
             </View>
             <View style={styles.progressBg}>
               <View style={[styles.progressFill, {
-                width: participants.length > 0
-                  ? `${(paidCount / participants.length) * 100}%` as any
+                width: group?.total_amount > 0
+                  ? `${Math.min((totalCollected / Number(group.total_amount)) * 100, 100)}%` as any
                   : '0%',
               }]} />
             </View>
@@ -215,85 +253,119 @@ export default function GroupDetailScreen() {
           {participants.length === 0 ? (
             <Text style={styles.emptyText}>No participants added.</Text>
           ) : (
-            participants.map((p) => (
-              <View key={p.id} style={[styles.participantCard, p.is_paid && styles.participantPaid]}>
-                <View style={styles.participantLeft}>
-                  <View style={[styles.avatar, {
-                    backgroundColor: p.is_paid ? colors.success + '25' : colors.ambaganLedger + '25',
-                  }]}>
-                    <Text style={[styles.avatarText, {
-                      color: p.is_paid ? colors.success : colors.ambaganLedger,
-                    }]}>
-                      {(p.participant?.full_name || p.participant?.email || '?')[0].toUpperCase()}
-                    </Text>
-                  </View>
-                  <View style={{ marginLeft: 12 }}>
-                    <Text style={styles.participantName}>
-                      {p.participant?.full_name || p.participant?.email}
-                    </Text>
-                    <Text style={styles.participantEmail}>{p.participant?.email}</Text>
-                    {p.is_paid && p.paid_at && (
-                      <Text style={styles.paidAt}>
-                        Paid {format(new Date(p.paid_at), 'MMM d, yyyy')}
-                      </Text>
-                    )}
-                  </View>
-                </View>
-                <View style={styles.participantRight}>
-                  <Text style={[styles.shareAmount, p.is_paid && { color: colors.success }]}>
-                    {formatCurrency(p.share_amount)}
-                  </Text>
-                  {p.is_paid ? (
-                    <View style={styles.paidBadge}>
-                      <Ionicons name="checkmark-circle" size={14} color={colors.success} />
-                      <Text style={styles.paidText}>Paid</Text>
-                    </View>
-                  ) : isPayer ? (
-                    <View style={styles.actionButtons}>
-                      <TouchableOpacity
-                        style={styles.markPaidBtn}
-                        onPress={() => openPayModal(p)}
-                      >
-                        <Text style={styles.markPaidText}>Mark Paid</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={[styles.singilBtn, sendingSingil === p.id && { opacity: 0.5 }]}
-                        onPress={() => handleSingil(p)}
-                        disabled={sendingSingil === p.id}
-                      >
-                        <Ionicons name="mail-outline" size={14} color={colors.secondary} />
-                        <Text style={styles.singilText}>
-                          {sendingSingil === p.id ? 'Sending...' : 'Singil'}
+            participants.map((p) => {
+              const fullyPaid = isFullyPaid(p);
+              const partiallyPaid = isPartiallyPaid(p);
+              const remaining = remainingFor(p);
+              const pct = Number(p.share_amount) > 0
+                ? Math.min((Number(p.amount_paid || 0) / Number(p.share_amount)) * 100, 100)
+                : 0;
+              return (
+                <View key={p.id} style={[styles.participantCard, fullyPaid && styles.participantPaid]}>
+                  <View style={styles.participantTopRow}>
+                    <View style={styles.participantLeft}>
+                      <View style={[styles.avatar, {
+                        backgroundColor: fullyPaid ? colors.success + '25' : colors.ambaganLedger + '25',
+                      }]}>
+                        <Text style={[styles.avatarText, {
+                          color: fullyPaid ? colors.success : colors.ambaganLedger,
+                        }]}>
+                          {(p.participant?.full_name || p.participant?.email || '?')[0].toUpperCase()}
                         </Text>
-                      </TouchableOpacity>
+                      </View>
+                      <View style={{ marginLeft: 12 }}>
+                        <Text style={styles.participantName}>
+                          {p.participant?.full_name || p.participant?.email}
+                        </Text>
+                        <Text style={styles.participantEmail}>{p.participant?.email}</Text>
+                        {fullyPaid && p.paid_at && (
+                          <Text style={styles.paidAt}>
+                            Paid {format(new Date(p.paid_at), 'MMM d, yyyy')}
+                          </Text>
+                        )}
+                      </View>
                     </View>
-                  ) : (
-                    <View style={styles.pendingBadge}>
-                      <Text style={styles.pendingText}>Pending</Text>
+                    <View style={styles.participantRight}>
+                      <Text style={[styles.shareAmount, fullyPaid && { color: colors.success }]}>
+                        {formatCurrency(p.share_amount)}
+                      </Text>
+                      {fullyPaid ? (
+                        <View style={styles.paidBadge}>
+                          <Ionicons name="checkmark-circle" size={14} color={colors.success} />
+                          <Text style={styles.paidText}>Paid</Text>
+                        </View>
+                      ) : partiallyPaid ? (
+                        <View style={styles.partialBadge}>
+                          <Text style={styles.partialText}>Partial</Text>
+                        </View>
+                      ) : (
+                        <View style={styles.pendingBadge}>
+                          <Text style={styles.pendingText}>Pending</Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+
+                  {/* Per-participant progress, shown once anything has been paid */}
+                  {(partiallyPaid || fullyPaid) && (
+                    <View style={styles.participantProgressSection}>
+                      <View style={styles.participantProgressBg}>
+                        <View style={[styles.participantProgressFill, {
+                          width: `${pct}%` as any,
+                          backgroundColor: fullyPaid ? colors.success : colors.warning,
+                        }]} />
+                      </View>
+                      <Text style={styles.participantProgressText}>
+                        {formatCurrency(p.amount_paid || 0)} of {formatCurrency(p.share_amount)}
+                        {!fullyPaid ? ` · ${formatCurrency(remaining)} left` : ''}
+                      </Text>
+                    </View>
+                  )}
+
+                  {!fullyPaid && (
+                    <View style={styles.actionRow}>
+                      {isPayer && (
+                        <TouchableOpacity style={styles.recordPayBtn} onPress={() => openPayModal(p)}>
+                          <Ionicons name="cash-outline" size={14} color="#fff" />
+                          <Text style={styles.recordPayText}>Record Payment</Text>
+                        </TouchableOpacity>
+                      )}
+                      {isPayer && (
+                        <TouchableOpacity
+                          style={[styles.singilBtn, sendingSingil === p.id && { opacity: 0.5 }]}
+                          onPress={() => handleSingil(p)}
+                          disabled={sendingSingil === p.id}
+                        >
+                          <Ionicons name="mail-outline" size={14} color={colors.secondary} />
+                          <Text style={styles.singilText}>
+                            {sendingSingil === p.id ? 'Sending...' : 'Singil'}
+                          </Text>
+                        </TouchableOpacity>
+                      )}
                     </View>
                   )}
                 </View>
-              </View>
-            ))
+              );
+            })
           )}
         </View>
         <View style={{ height: 32 }} />
       </ScrollView>
 
-      {/* Mark Paid Confirmation Modal */}
+      {/* Record Payment Modal */}
       <Modal visible={showPayModal} animationType="slide" transparent>
         <KeyboardAvoidingView style={styles.modalOverlay} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
           <View style={styles.modal}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Confirm Payment</Text>
+              <Text style={styles.modalTitle}>Record Payment</Text>
               <TouchableOpacity onPress={() => setShowPayModal(false)} style={styles.closeBtn}>
                 <Ionicons name="close" size={20} color={colors.textSecondary} />
               </TouchableOpacity>
             </View>
 
             {payingParticipant && (
-              <>
-                {/* Who paid */}
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                {/* Who's paying */}
                 <View style={styles.payConfirmCard}>
                   <View style={styles.payConfirmLeft}>
                     <View style={[styles.avatar, { backgroundColor: colors.ambaganLedger + '25' }]}>
@@ -309,35 +381,58 @@ export default function GroupDetailScreen() {
                     </View>
                   </View>
                   <Text style={styles.payConfirmAmount}>
-                    {formatCurrency(payingParticipant.share_amount)}
+                    {formatCurrency(remainingFor(payingParticipant))} left
                   </Text>
                 </View>
 
-                {/* Payment method selection */}
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.inputLabel}>Amount Paid (₱)</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="0.00"
+                    placeholderTextColor={colors.textLight}
+                    value={payAmount}
+                    onChangeText={setPayAmount}
+                    keyboardType="decimal-pad"
+                  />
+                </View>
+
                 <Text style={styles.payMethodLabel}>Payment method used</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 16 }}>
-                  {PAYMENT_METHODS.map((m) => (
-                    <TouchableOpacity
-                      key={m}
-                      style={[styles.methodChip, selectedPayMethod === m && styles.methodChipActive]}
-                      onPress={() => setSelectedPayMethod(m)}
-                    >
-                      <Text style={[styles.methodChipText, selectedPayMethod === m && styles.methodChipTextActive]}>
-                        {m}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    {PAYMENT_METHODS.map((m) => (
+                      <TouchableOpacity
+                        key={m}
+                        style={[styles.methodChip, selectedPayMethod === m && styles.methodChipActive]}
+                        onPress={() => setSelectedPayMethod(m)}
+                      >
+                        <Text style={[styles.methodChipText, selectedPayMethod === m && styles.methodChipTextActive]}>
+                          {m}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
                 </ScrollView>
 
-                <TouchableOpacity style={styles.confirmBtn} onPress={confirmMarkPaid}>
+                <TouchableOpacity style={styles.confirmBtn} onPress={confirmRecordPayment}>
                   <Ionicons name="checkmark-circle" size={18} color="#fff" />
-                  <Text style={styles.confirmBtnText}>Confirm Paid</Text>
+                  <Text style={styles.confirmBtnText}>Save Payment</Text>
                 </TouchableOpacity>
-              </>
+              </ScrollView>
             )}
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      <AppModal
+        visible={showErrorModal}
+        onClose={() => setShowErrorModal(false)}
+        icon="alert-circle"
+        iconColor={colors.error}
+        title="Error"
+        message={errorMsg}
+        buttons={[{ label: 'Got It', onPress: () => setShowErrorModal(false) }]}
+      />
 
       <AppModal
         visible={showSingilConfirm}
@@ -403,10 +498,10 @@ const makeStyles = (colors: ReturnType<typeof import('../context/ThemeContext').
     emptyText: { color: colors.textLight, fontSize: 14, textAlign: 'center', padding: 16 },
     participantCard: {
       backgroundColor: colors.surface, borderRadius: 12, padding: 14,
-      flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
       marginBottom: 8, elevation: 1,
     },
     participantPaid: { opacity: 0.75 },
+    participantTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
     participantLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
     avatar: { width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
     avatarText: { fontSize: 16, fontWeight: '700' },
@@ -417,16 +512,22 @@ const makeStyles = (colors: ReturnType<typeof import('../context/ThemeContext').
     shareAmount: { fontSize: 15, fontWeight: '800', color: colors.textPrimary },
     paidBadge: { flexDirection: 'row', alignItems: 'center', gap: 4 },
     paidText: { fontSize: 12, color: colors.success, fontWeight: '600' },
-    pendingBadge: { backgroundColor: colors.warning + '25', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
-    pendingText: { fontSize: 11, color: colors.warning, fontWeight: '600' },
-    actionButtons: { gap: 4 },
-    markPaidBtn: { backgroundColor: colors.primary + '20', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8 },
-    markPaidText: { fontSize: 11, color: colors.primary, fontWeight: '600' },
-    singilBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: colors.secondary + '20', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8 },
-    singilText: { fontSize: 11, color: colors.secondary, fontWeight: '600' },
-    // Mark Paid Modal
+    partialBadge: { backgroundColor: colors.warning + '25', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
+    partialText: { fontSize: 11, color: colors.warning, fontWeight: '600' },
+    pendingBadge: { backgroundColor: colors.border, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
+    pendingText: { fontSize: 11, color: colors.textSecondary, fontWeight: '600' },
+    participantProgressSection: { marginTop: 10 },
+    participantProgressBg: { height: 5, backgroundColor: colors.border, borderRadius: 3, overflow: 'hidden' },
+    participantProgressFill: { height: 5, borderRadius: 3 },
+    participantProgressText: { fontSize: 11, color: colors.textSecondary, marginTop: 4, fontWeight: '500' },
+    actionRow: { flexDirection: 'row', gap: 6, marginTop: 10 },
+    recordPayBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: colors.ambaganLedger, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 8 },
+    recordPayText: { fontSize: 12, color: '#fff', fontWeight: '700' },
+    singilBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: colors.secondary + '20', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 8 },
+    singilText: { fontSize: 12, color: colors.secondary, fontWeight: '600' },
+    // Record Payment Modal
     modalOverlay: { flex: 1, backgroundColor: colors.overlay, justifyContent: 'flex-end' },
-    modal: { backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, maxHeight: '70%' },
+    modal: { backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, maxHeight: '85%' },
     modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
     modalTitle: { fontSize: 17, fontWeight: '700', color: colors.textPrimary },
     closeBtn: { padding: 4, borderRadius: 20, backgroundColor: colors.border },
@@ -438,7 +539,17 @@ const makeStyles = (colors: ReturnType<typeof import('../context/ThemeContext').
     payConfirmLeft: { flexDirection: 'row', alignItems: 'center' },
     payConfirmName: { fontSize: 14, fontWeight: '700', color: colors.textPrimary },
     payConfirmEmail: { fontSize: 12, color: colors.textSecondary, marginTop: 1 },
-    payConfirmAmount: { fontSize: 16, fontWeight: '800', color: colors.ambaganLedger },
+    payConfirmAmount: { fontSize: 15, fontWeight: '800', color: colors.ambaganLedger },
+    fieldGroup: { marginBottom: 16 },
+    inputLabel: {
+      fontSize: 12, fontWeight: '700', color: colors.textSecondary,
+      textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8,
+    },
+    input: {
+      borderWidth: 1.5, borderColor: colors.border, borderRadius: 14,
+      paddingHorizontal: 16, paddingVertical: 14,
+      fontSize: 15, color: colors.textPrimary, backgroundColor: colors.background,
+    },
     payMethodLabel: { fontSize: 13, fontWeight: '600', color: colors.textSecondary, marginBottom: 8 },
     methodChip: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1, borderColor: colors.border, marginRight: 8, backgroundColor: colors.background },
     methodChipActive: { backgroundColor: colors.ambaganLedger, borderColor: colors.ambaganLedger },
