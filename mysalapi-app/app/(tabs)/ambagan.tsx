@@ -1,20 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, TouchableOpacity,
-  Modal, TextInput, Alert, RefreshControl, KeyboardAvoidingView, Platform, ActivityIndicator,
+  Modal, TextInput, Alert, RefreshControl, KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import * as Haptics from 'expo-haptics';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import { format } from 'date-fns';
-import { getFriendlyError, logError } from '../../lib/errorMessages';
-import { showSuccessToast, showErrorToast } from '../../lib/toast';
 import DateInput from '../../components/DateInput';
 import DraggableModal from '../../components/DraggableModal';
-import AmountInput from '../../components/AmountInput';
 
 // One entry in custom split mode
 interface CustomMember {
@@ -27,10 +23,9 @@ export default function AmbaganScreen() {
   const { colors } = useTheme();
   const router = useRouter();
   const [groups, setGroups] = useState<any[]>([]);
-  const [groupCounts, setGroupCounts] = useState<Record<string, { paid: number; total: number }>>({});
+  const [groupCounts, setGroupCounts] = useState<Record<string, { collected: number; total: number; fullyPaid: number; participantCount: number }>>({});
   const [showCreate, setShowCreate] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [creating, setCreating] = useState(false);
 
   // Shared fields
   const [title, setTitle] = useState('');
@@ -64,59 +59,6 @@ export default function AmbaganScreen() {
     setCustomMembers([{ email: '', amount: '' }]);
   };
 
-  // Helper function to offer saving participants as contacts
-  const offerSaveParticipantsAsContacts = async (memberUsers: any[]) => {
-    // Check which members are not already in contacts
-    const { data: existingContacts } = await supabase
-      .from('contacts')
-      .select('email')
-      .eq('user_id', user!.id)
-      .in('email', memberUsers.map(m => m.email.toLowerCase()));
-    
-    const existingEmails = new Set((existingContacts || []).map(c => c.email.toLowerCase()));
-    const newMembers = memberUsers.filter(m => !existingEmails.has(m.email.toLowerCase()));
-    
-    if (newMembers.length === 0) return; // All already in contacts
-    
-    const memberNames = newMembers.map(m => m.full_name || m.email).join(', ');
-    const message = newMembers.length === 1
-      ? `Would you like to save ${memberNames} to your contacts for quick access next time?`
-      : `Would you like to save these ${newMembers.length} members to your contacts for quick access next time?\n\n${memberNames}`;
-    
-    setTimeout(() => {
-      Alert.alert(
-        'Save to Contacts?',
-        message,
-        [
-          { text: 'No, Thanks', style: 'cancel' },
-          {
-            text: 'Save All',
-            onPress: async () => {
-              const contactsToAdd = newMembers.map(m => ({
-                user_id: user!.id,
-                email: m.email.toLowerCase(),
-                full_name: m.full_name || '',
-              }));
-              
-              const { error: contactError } = await supabase
-                .from('contacts')
-                .insert(contactsToAdd);
-              
-              if (contactError) {
-                logError(contactError, 'saveContacts');
-                showErrorToast('Could not save contacts');
-              } else {
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-                const count = newMembers.length;
-                showSuccessToast(`✓ ${count} ${count === 1 ? 'contact' : 'contacts'} added`);
-              }
-            },
-          },
-        ]
-      );
-    }, 600);
-  };
-
   const loadGroups = async () => {
     if (!user) return;
     const { data } = await supabase
@@ -126,19 +68,25 @@ export default function AmbaganScreen() {
       .order('created_at', { ascending: false });
     setGroups(data || []);
 
-    // Fetch participant counts for each group
+    // Fetch participant payment progress for each group
     if (data && data.length > 0) {
       const ids = data.map((g: any) => g.id);
       const { data: participants } = await supabase
         .from('group_participants')
-        .select('group_expense_id, is_paid')
+        .select('group_expense_id, share_amount, amount_paid')
         .in('group_expense_id', ids);
 
-      const counts: Record<string, { paid: number; total: number }> = {};
+      const counts: Record<string, { collected: number; total: number; fullyPaid: number; participantCount: number }> = {};
       (participants || []).forEach((p: any) => {
-        if (!counts[p.group_expense_id]) counts[p.group_expense_id] = { paid: 0, total: 0 };
-        counts[p.group_expense_id].total++;
-        if (p.is_paid) counts[p.group_expense_id].paid++;
+        if (!counts[p.group_expense_id]) {
+          counts[p.group_expense_id] = { collected: 0, total: 0, fullyPaid: 0, participantCount: 0 };
+        }
+        const share = Number(p.share_amount);
+        const paid = Number(p.amount_paid || 0);
+        counts[p.group_expense_id].collected += paid;
+        counts[p.group_expense_id].total += share;
+        counts[p.group_expense_id].participantCount++;
+        if (paid >= share) counts[p.group_expense_id].fullyPaid++;
       });
       setGroupCounts(counts);
     }
@@ -150,168 +98,105 @@ export default function AmbaganScreen() {
   // ── Equal split ──────────────────────────────────────────────────────────
   const createEqualGroup = async () => {
     if (!title || !totalAmount) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showErrorToast('Title and amount are required');
+      Alert.alert('Error', 'Title and amount are required.');
       return;
     }
-    
     const amount = parseFloat(totalAmount);
-    if (isNaN(amount) || amount <= 0) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showErrorToast('Enter a valid amount');
-      return;
-    }
+    if (isNaN(amount) || amount <= 0) { Alert.alert('Error', 'Enter a valid amount.'); return; }
 
     const emails = equalMembers.map((e) => e.trim().toLowerCase()).filter(Boolean);
-    if (emails.length === 0) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showErrorToast('Add at least one member email');
+    if (emails.length === 0) { Alert.alert('Error', 'Add at least one member email.'); return; }
+
+    const { data: memberUsers } = await supabase
+      .from('users').select('id, email, full_name').in('email', emails);
+    if (!memberUsers || memberUsers.length === 0) {
+      Alert.alert('Error', 'No valid MySalapi users found with those emails.');
       return;
     }
 
-    setCreating(true);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const totalMembers = memberUsers.length + 1; // +1 for payer
+    const sharePerPerson = amount / totalMembers;
 
-    try {
-      const { data: memberUsers, error: userError } = await supabase
-        .from('users').select('id, email, full_name').in('email', emails);
-      
-      if (userError) throw userError;
-      
-      if (!memberUsers || memberUsers.length === 0) {
-        throw new Error('No valid MySalapi users found with those emails');
-      }
+    const { data: group, error } = await supabase.from('group_expenses').insert({
+      payer_id: user!.id, title, total_amount: amount,
+      expense_date: expenseDate, category, split_method: 'equal', status: 'active',
+      payment_method: paymentMethod, payment_details: paymentDetails,
+    }).select().single();
+    if (error || !group) { Alert.alert('Error', error?.message || 'Failed to create group.'); return; }
 
-      const totalMembers = memberUsers.length + 1; // +1 for payer
-      const sharePerPerson = amount / totalMembers;
+    await supabase.from('group_participants').insert(
+      memberUsers.map((u: any) => ({
+        group_expense_id: group.id, participant_id: u.id,
+        share_amount: sharePerPerson, is_paid: false,
+      }))
+    );
 
-      const { data: group, error: groupError } = await supabase.from('group_expenses').insert({
-        payer_id: user!.id, title, total_amount: amount,
-        expense_date: expenseDate, category, split_method: 'equal', status: 'active',
-        payment_method: paymentMethod, payment_details: paymentDetails,
-      }).select().single();
-      
-      if (groupError || !group) throw groupError || new Error('Failed to create group');
-
-      const { error: participantError } = await supabase.from('group_participants').insert(
-        memberUsers.map((u: any) => ({
-          group_expense_id: group.id, participant_id: u.id,
-          share_amount: sharePerPerson, is_paid: false,
-        }))
-      );
-      
-      if (participantError) throw participantError;
-
-      // Success!
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      setShowCreate(false);
-      resetForm();
-      await loadGroups();
-      
-      showSuccessToast('👥 Group expense created!', `Split equally among ${totalMembers} people`);
-      
-      // Offer to save participants as contacts
-      offerSaveParticipantsAsContacts(memberUsers);
-    } catch (error: any) {
-      logError(error, 'createEqualGroup');
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      const friendlyMessage = getFriendlyError(error);
-      showErrorToast(friendlyMessage);
-    } finally {
-      setCreating(false);
-    }
+    setShowCreate(false);
+    resetForm();
+    loadGroups();
   };
 
   // ── Custom split ─────────────────────────────────────────────────────────
   const createCustomGroup = async () => {
-    if (!title) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showErrorToast('Title is required');
-      return;
-    }
+    if (!title) { Alert.alert('Error', 'Title is required.'); return; }
 
     const validMembers = customMembers.filter(
       (m) => m.email.trim() && m.amount.trim() && parseFloat(m.amount) > 0
     );
-    
     if (validMembers.length === 0) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      showErrorToast('Add at least one member with email and amount');
+      Alert.alert('Error', 'Add at least one member with a valid email and amount.');
       return;
     }
 
     // Validate all amounts are numbers
     for (const m of validMembers) {
       if (isNaN(parseFloat(m.amount)) || parseFloat(m.amount) <= 0) {
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-        showErrorToast(`Invalid amount for ${m.email}`);
+        Alert.alert('Error', `Invalid amount for ${m.email}`);
         return;
       }
     }
 
-    setCreating(true);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-
-    try {
-      const emails = validMembers.map((m) => m.email.trim().toLowerCase());
-      const { data: memberUsers, error: userError } = await supabase
-        .from('users').select('id, email, full_name').in('email', emails);
-      
-      if (userError) throw userError;
-      
-      if (!memberUsers || memberUsers.length === 0) {
-        throw new Error('No valid MySalapi users found with those emails');
-      }
-
-      const totalAmt = validMembers.reduce((s, m) => s + parseFloat(m.amount), 0);
-
-      const { data: group, error: groupError } = await supabase.from('group_expenses').insert({
-        payer_id: user!.id, title, total_amount: totalAmt,
-        expense_date: expenseDate, category, split_method: 'custom', status: 'active',
-        payment_method: paymentMethod, payment_details: paymentDetails,
-      }).select().single();
-      
-      if (groupError || !group) throw groupError || new Error('Failed to create group');
-
-      // Match each email to a user and insert with their specific amount
-      const participantRows = validMembers.map((m) => {
-        const found = memberUsers.find(
-          (u: any) => u.email === m.email.trim().toLowerCase()
-        );
-        return found ? {
-          group_expense_id: group.id,
-          participant_id: found.id,
-          share_amount: parseFloat(m.amount),
-          is_paid: false,
-        } : null;
-      }).filter(Boolean);
-
-      if (participantRows.length === 0) {
-        await supabase.from('group_expenses').delete().eq('id', group.id);
-        throw new Error('None of the emails matched registered MySalapi users');
-      }
-
-      const { error: participantError } = await supabase.from('group_participants').insert(participantRows);
-      if (participantError) throw participantError;
-
-      // Success!
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      setShowCreate(false);
-      resetForm();
-      await loadGroups();
-      
-      showSuccessToast('👥 Group expense created!', `Custom split with ${participantRows.length} members`);
-      
-      // Offer to save participants as contacts
-      offerSaveParticipantsAsContacts(memberUsers);
-    } catch (error: any) {
-      logError(error, 'createCustomGroup');
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      const friendlyMessage = getFriendlyError(error);
-      showErrorToast(friendlyMessage);
-    } finally {
-      setCreating(false);
+    const emails = validMembers.map((m) => m.email.trim().toLowerCase());
+    const { data: memberUsers } = await supabase
+      .from('users').select('id, email, full_name').in('email', emails);
+    if (!memberUsers || memberUsers.length === 0) {
+      Alert.alert('Error', 'No valid MySalapi users found with those emails.');
+      return;
     }
+
+    const totalAmt = validMembers.reduce((s, m) => s + parseFloat(m.amount), 0);
+
+    const { data: group, error } = await supabase.from('group_expenses').insert({
+      payer_id: user!.id, title, total_amount: totalAmt,
+      expense_date: expenseDate, category, split_method: 'custom', status: 'active',
+      payment_method: paymentMethod, payment_details: paymentDetails,
+    }).select().single();
+    if (error || !group) { Alert.alert('Error', error?.message || 'Failed to create group.'); return; }
+
+    // Match each email to a user and insert with their specific amount
+    const participantRows = validMembers.map((m) => {
+      const found = memberUsers.find(
+        (u: any) => u.email === m.email.trim().toLowerCase()
+      );
+      return found ? {
+        group_expense_id: group.id,
+        participant_id: found.id,
+        share_amount: parseFloat(m.amount),
+        is_paid: false,
+      } : null;
+    }).filter(Boolean);
+
+    if (participantRows.length === 0) {
+      Alert.alert('Error', 'None of the emails matched registered MySalapi users.');
+      await supabase.from('group_expenses').delete().eq('id', group.id);
+      return;
+    }
+
+    await supabase.from('group_participants').insert(participantRows);
+
+    setShowCreate(false);
+    resetForm();
+    loadGroups();
   };
 
   const addCustomMember = () => {
@@ -359,63 +244,65 @@ export default function AmbaganScreen() {
             <Text style={styles.emptyText}>Tap + to create a shared expense with friends</Text>
           </View>
         ) : (
-          groups.map((group) => (
-            <TouchableOpacity
-              key={group.id}
-              style={styles.groupCard}
-              onPress={() => router.push({ pathname: '/group-detail' as any, params: { id: group.id } })}
-            >
-              <View style={styles.groupHeader}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.groupTitle}>{group.title}</Text>
-                  <Text style={styles.groupDate}>
-                    {format(new Date(group.expense_date), 'MMM d, yyyy')} · {group.category}
-                  </Text>
-                </View>
-                <Text style={styles.groupAmount}>{formatCurrency(group.total_amount)}</Text>
-              </View>
-              <View style={styles.groupFooter}>
-                <View style={styles.splitBadge}>
-                  <Ionicons
-                    name={group.split_method === 'equal' ? 'git-branch-outline' : 'options-outline'}
-                    size={12}
-                    color={colors.ambaganLedger}
-                  />
-                  <Text style={styles.groupSub}>
-                    {group.split_method === 'equal' ? 'Equal split' : 'Custom split'}
-                  </Text>
-                </View>
-                <View style={[styles.statusBadge, {
-                  backgroundColor: group.status === 'settled' ? colors.success + '25' : colors.warning + '25',
-                }]}>
-                  <Text style={[styles.statusText, {
-                    color: group.status === 'settled' ? colors.success : colors.warning,
-                  }]}>
-                    {group.status === 'settled' ? 'Settled' : 'Active'}
-                  </Text>
-                </View>
-              </View>
-              {/* Paid / Total indicator */}
-              {groupCounts[group.id] && (
-                <View style={styles.paidIndicatorRow}>
-                  <View style={styles.paidIndicatorBar}>
-                    <View style={[styles.paidIndicatorFill, {
-                      width: groupCounts[group.id].total > 0
-                        ? `${(groupCounts[group.id].paid / groupCounts[group.id].total) * 100}%` as any
-                        : '0%',
-                    }]} />
+          groups.map((group) => {
+            const counts = groupCounts[group.id];
+            const pct = counts && counts.total > 0
+              ? Math.min((counts.collected / counts.total) * 100, 100)
+              : 0;
+            return (
+              <TouchableOpacity
+                key={group.id}
+                style={styles.groupCard}
+                onPress={() => router.push({ pathname: '/group-detail' as any, params: { id: group.id } })}
+              >
+                <View style={styles.groupHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.groupTitle}>{group.title}</Text>
+                    <Text style={styles.groupDate}>
+                      {format(new Date(group.expense_date), 'MMM d, yyyy')} · {group.category}
+                    </Text>
                   </View>
-                  <Text style={styles.paidIndicatorText}>
-                    {groupCounts[group.id].paid}/{groupCounts[group.id].total} paid
-                  </Text>
+                  <Text style={styles.groupAmount}>{formatCurrency(group.total_amount)}</Text>
                 </View>
-              )}
-              <View style={styles.tapHint}>
-                <Ionicons name="chevron-forward" size={14} color={colors.textLight} />
-                <Text style={styles.tapHintText}>Tap to view participants</Text>
-              </View>
-            </TouchableOpacity>
-          ))
+                <View style={styles.groupFooter}>
+                  <View style={styles.splitBadge}>
+                    <Ionicons
+                      name={group.split_method === 'equal' ? 'git-branch-outline' : 'options-outline'}
+                      size={12}
+                      color={colors.ambaganLedger}
+                    />
+                    <Text style={styles.groupSub}>
+                      {group.split_method === 'equal' ? 'Equal split' : 'Custom split'}
+                    </Text>
+                  </View>
+                  <View style={[styles.statusBadge, {
+                    backgroundColor: group.status === 'settled' ? colors.success + '25' : colors.warning + '25',
+                  }]}>
+                    <Text style={[styles.statusText, {
+                      color: group.status === 'settled' ? colors.success : colors.warning,
+                    }]}>
+                      {group.status === 'settled' ? 'Settled' : 'Active'}
+                    </Text>
+                  </View>
+                </View>
+                {/* Collected / Total indicator, based on actual amounts paid (reflects partial payments) */}
+                {counts && (
+                  <View style={styles.paidIndicatorRow}>
+                    <View style={styles.paidIndicatorBar}>
+                      <View style={[styles.paidIndicatorFill, { width: `${pct}%` as any }]} />
+                    </View>
+                    <Text style={styles.paidIndicatorText}>
+                      {counts.fullyPaid}/{counts.participantCount} paid · {formatCurrency(counts.collected)} collected
+                    </Text>
+                  </View>
+                )}
+                <View style={styles.tapHint}>
+                  <Ionicons name="chevron-forward" size={14} color={colors.textLight} />
+                  <Text style={styles.tapHintText}>Tap to view participants</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })
         )}
       </ScrollView>
 
@@ -467,20 +354,14 @@ export default function AmbaganScreen() {
                 <View style={styles.splitToggle}>
                   <TouchableOpacity
                     style={[styles.splitOption, splitMode === 'equal' && styles.splitOptionActive]}
-                    onPress={() => {
-                      Haptics.selectionAsync();
-                      setSplitMode('equal');
-                    }}
+                    onPress={() => setSplitMode('equal')}
                   >
                     <Ionicons name="git-branch-outline" size={16} color={splitMode === 'equal' ? '#fff' : colors.textSecondary} />
                     <Text style={[styles.splitOptionText, splitMode === 'equal' && styles.splitOptionTextActive]}>Equal Split</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={[styles.splitOption, splitMode === 'custom' && styles.splitOptionActive]}
-                    onPress={() => {
-                      Haptics.selectionAsync();
-                      setSplitMode('custom');
-                    }}
+                    onPress={() => setSplitMode('custom')}
                   >
                     <Ionicons name="options-outline" size={16} color={splitMode === 'custom' ? '#fff' : colors.textSecondary} />
                     <Text style={[styles.splitOptionText, splitMode === 'custom' && styles.splitOptionTextActive]}>Custom Split</Text>
@@ -541,14 +422,7 @@ export default function AmbaganScreen() {
                     <ScrollView horizontal showsHorizontalScrollIndicator={false}>
                       <View style={{ flexDirection: 'row', gap: 8 }}>
                         {['GCash', 'Maya', 'BDO', 'BPI', 'Cash', 'Other'].map((m) => (
-                          <TouchableOpacity
-                            key={m}
-                            style={[styles.methodChip, paymentMethod === m && styles.methodChipActive]}
-                            onPress={() => {
-                              Haptics.selectionAsync();
-                              setPaymentMethod(m);
-                            }}
-                          >
+                          <TouchableOpacity key={m} style={[styles.methodChip, paymentMethod === m && styles.methodChipActive]} onPress={() => setPaymentMethod(m)}>
                             <Text style={[styles.methodChipText, paymentMethod === m && styles.methodChipTextActive]}>{m}</Text>
                           </TouchableOpacity>
                         ))}
@@ -563,23 +437,8 @@ export default function AmbaganScreen() {
                       value={paymentDetails} onChangeText={setPaymentDetails}
                     />
                   </View>
-                  <TouchableOpacity
-                    style={[
-                      styles.saveBtn,
-                      { backgroundColor: colors.ambaganLedger, shadowColor: colors.ambaganLedger },
-                      creating && styles.saveBtnDisabled
-                    ]}
-                    onPress={createEqualGroup}
-                    disabled={creating}
-                  >
-                    {creating ? (
-                      <>
-                        <ActivityIndicator size="small" color="#fff" style={{ marginRight: 8 }} />
-                        <Text style={styles.saveBtnText}>Creating...</Text>
-                      </>
-                    ) : (
-                      <Text style={styles.saveBtnText}>Create Group</Text>
-                    )}
+                  <TouchableOpacity style={[styles.saveBtn, { backgroundColor: colors.ambaganLedger, shadowColor: colors.ambaganLedger }]} onPress={createEqualGroup}>
+                    <Text style={styles.saveBtnText}>Create Group</Text>
                   </TouchableOpacity>
                 </>
               )}
@@ -629,14 +488,7 @@ export default function AmbaganScreen() {
                     <ScrollView horizontal showsHorizontalScrollIndicator={false}>
                       <View style={{ flexDirection: 'row', gap: 8 }}>
                         {['GCash', 'Maya', 'BDO', 'BPI', 'Cash', 'Other'].map((m) => (
-                          <TouchableOpacity
-                            key={m}
-                            style={[styles.methodChip, paymentMethod === m && styles.methodChipActive]}
-                            onPress={() => {
-                              Haptics.selectionAsync();
-                              setPaymentMethod(m);
-                            }}
-                          >
+                          <TouchableOpacity key={m} style={[styles.methodChip, paymentMethod === m && styles.methodChipActive]} onPress={() => setPaymentMethod(m)}>
                             <Text style={[styles.methodChipText, paymentMethod === m && styles.methodChipTextActive]}>{m}</Text>
                           </TouchableOpacity>
                         ))}
@@ -651,23 +503,8 @@ export default function AmbaganScreen() {
                       value={paymentDetails} onChangeText={setPaymentDetails}
                     />
                   </View>
-                  <TouchableOpacity
-                    style={[
-                      styles.saveBtn,
-                      { backgroundColor: colors.ambaganLedger, shadowColor: colors.ambaganLedger, marginTop: 4 },
-                      creating && styles.saveBtnDisabled
-                    ]}
-                    onPress={createCustomGroup}
-                    disabled={creating}
-                  >
-                    {creating ? (
-                      <>
-                        <ActivityIndicator size="small" color="#fff" style={{ marginRight: 8 }} />
-                        <Text style={styles.saveBtnText}>Creating...</Text>
-                      </>
-                    ) : (
-                      <Text style={styles.saveBtnText}>Create Group</Text>
-                    )}
+                  <TouchableOpacity style={[styles.saveBtn, { backgroundColor: colors.ambaganLedger, shadowColor: colors.ambaganLedger, marginTop: 4 }]} onPress={createCustomGroup}>
+                    <Text style={styles.saveBtnText}>Create Group</Text>
                   </TouchableOpacity>
                 </>
               )}
@@ -768,10 +605,6 @@ const makeStyles = (colors: ReturnType<typeof import('../../context/ThemeContext
     saveBtn: {
       padding: 16, borderRadius: 14, alignItems: 'center', marginBottom: 8,
       shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8, elevation: 4,
-      flexDirection: 'row', justifyContent: 'center',
-    },
-    saveBtnDisabled: {
-      opacity: 0.6,
     },
     saveBtnText: { color: '#fff', fontWeight: '700', fontSize: 16, letterSpacing: 0.3 },
     // Split toggle

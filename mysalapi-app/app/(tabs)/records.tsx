@@ -370,7 +370,7 @@ export default function RecordsScreen() {
 
   // ─── AMBAGAN state ────────────────────────────────────────────────────────
   const [groups, setGroups] = useState<any[]>([]);
-  const [groupCounts, setGroupCounts] = useState<Record<string, { paid: number; total: number }>>({});
+  const [groupCounts, setGroupCounts] = useState<Record<string, { collected: number; total: number; fullyPaid: number; participantCount: number }>>({});
   const [showCreate, setShowCreate] = useState(false);
   const [ambaganRefreshing, setAmbaganRefreshing] = useState(false);
   const [showAmbaganFilterModal, setShowAmbaganFilterModal] = useState(false);
@@ -391,9 +391,9 @@ export default function RecordsScreen() {
     setGroups(data || []);
     if (data && data.length > 0) {
       const ids = data.map((g: any) => g.id);
-      const { data: participants } = await supabase.from('group_participants').select('group_expense_id, is_paid').in('group_expense_id', ids);
-      const counts: Record<string, { paid: number; total: number }> = {};
-      (participants || []).forEach((p: any) => { if (!counts[p.group_expense_id]) counts[p.group_expense_id] = { paid: 0, total: 0 }; counts[p.group_expense_id].total++; if (p.is_paid) counts[p.group_expense_id].paid++; });
+      const { data: participants } = await supabase.from('group_participants').select('group_expense_id, share_amount, amount_paid').in('group_expense_id', ids);
+      const counts: Record<string,   { collected: number; total: number; fullyPaid: number; participantCount: number }> = {};
+      (participants || []).forEach((p: any) => { if (!counts[p.group_expense_id]) counts[p.group_expense_id] = { collected: 0, total: 0, fullyPaid: 0, participantCount: 0 }; const share = Number(p.share_amount); const paid = Number(p.amount_paid || 0); counts[p.group_expense_id].collected += paid; counts[p.group_expense_id].total += share; counts[p.group_expense_id].participantCount++; if (paid >= share) counts[p.group_expense_id].fullyPaid++; });
       setGroupCounts(counts);
     }
   };
@@ -1009,12 +1009,12 @@ export default function RecordsScreen() {
                       <Text style={[styles.statusText, { color: group.status === 'settled' ? colors.success : colors.warning }]}>{group.status === 'settled' ? 'Settled' : 'Active'}</Text>
                     </View>
                   </View>
-                  {groupCounts[group.id] && (
+                                    {groupCounts[group.id] && (
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 }}>
                       <View style={{ flex: 1, height: 4, backgroundColor: colors.borderLight || colors.border, borderRadius: 2, overflow: 'hidden' }}>
-                        <View style={{ height: '100%', backgroundColor: colors.ambaganLedger, borderRadius: 2, width: groupCounts[group.id].total > 0 ? `${(groupCounts[group.id].paid / groupCounts[group.id].total) * 100}%` as any : '0%' }} />
+                        <View style={{ height: '100%', backgroundColor: colors.ambaganLedger, borderRadius: 2, width: groupCounts[group.id].total > 0 ? `${Math.min((groupCounts[group.id].collected / groupCounts[group.id].total) * 100, 100)}%` as any : '0%' }} />
                       </View>
-                      <Text style={{ fontSize: 11, color: colors.textSecondary, fontWeight: '600' }}>{groupCounts[group.id].paid}/{groupCounts[group.id].total} paid</Text>
+                      <Text style={{ fontSize: 11, color: colors.textSecondary, fontWeight: '600' }}>{groupCounts[group.id].fullyPaid}/{groupCounts[group.id].participantCount} paid</Text>
                     </View>
                   )}
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6 }}>
